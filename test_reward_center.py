@@ -9,6 +9,7 @@
 """
 
 import json
+import threading
 import unittest
 
 import reward_center as rc
@@ -278,13 +279,42 @@ class CrossEffectiveDateReconsiderationTest(unittest.TestCase):
         self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
         self.assertEqual(self.c.adjustments[adj_id]["status"], "已生效")
 
+        # 生效只改核准上限：不自动追回，已付仍为 25 万，待追回 10 万
+        adj = self.c.adjustments[adj_id]
+        self.assertEqual(adj["paid_at_effect"], 250_000)
+        self.assertEqual(adj["recover_due"], 100_000)
+        self.assertEqual(adj["supplement_due"], 0)
         explained = self.c.explain_case(self.case)["reporters"][0]
+        self.assertEqual(explained["approved_amount"], 150_000)
         self.assertEqual(explained["effective_amount"], 150_000)
-        self.assertEqual(explained["paid_total"], 150_000)  # 25 万 - 10 万追回
+        self.assertEqual(explained["paid_amount"], 250_000)
+        self.assertEqual(explained["paid_total"], 250_000)
+        self.assertEqual(explained["payable_amount"], 0)
+        self.assertEqual(explained["recoverable_amount"], 100_000)
+        # 生效本身不产生资金流水
+        self.assertEqual(len(explained["fund_flows"]), 1)
         self.assertEqual(len(explained["adjustments"]), 1)
         self.assertEqual(explained["adjustments"][0]["kind_label"],
                          "行政复议变化")
         self.assertEqual(explained["pending_approvals"], [])
+
+        # 追回由支付执行人按实际收回登记，且不得超过已付超额
+        with self.assertRaises(PermissionDenied):
+            self.c.recover_overpayment(self.did, "reviewer-2", REVIEWER)
+        with self.assertRaises(DomainError):
+            self.c.recover_overpayment(self.did, "payer-1", PAYER,
+                                       amount=100_001)
+        rec = self.c.recover_overpayment(self.did, "payer-1", PAYER,
+                                         amount=100_000)
+        self.assertEqual(rec["amount"], -100_000)
+        self.assertEqual(rec["fund_kind"], "recovery")
+        explained = self.c.explain_case(self.case)["reporters"][0]
+        self.assertEqual(explained["paid_amount"], 150_000)
+        self.assertEqual(explained["paid_total"], 150_000)
+        self.assertEqual(explained["recoverable_amount"], 0)
+        # 超额已全部追回后不得再次登记
+        with self.assertRaises(DomainError):
+            self.c.recover_overpayment(self.did, "payer-1", PAYER, amount=1)
 
         # 旧结论继续保留：原决定仍是 25 万，且记录追加决定沿革
         self.assertEqual(self.c.decisions[self.did]["amount"], 250_000)
@@ -404,8 +434,18 @@ class WithdrawalAndDuplicateAdjustmentTest(unittest.TestCase):
         self.c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
         explained = self.c.explain_case(self.case)["reporters"][0]
         self.assertFalse(explained["eligible"])
+        self.assertEqual(explained["approved_amount"], 0)
         self.assertEqual(explained["effective_amount"], 0)
-        self.assertEqual(explained["paid_total"], 0)  # 28000 - 28000 追回
+        # 生效不自动追回：已付仍为 28000，全部列为待追回
+        self.assertEqual(explained["paid_amount"], 28_000)
+        self.assertEqual(explained["paid_total"], 28_000)
+        self.assertEqual(explained["recoverable_amount"], 28_000)
+        # 支付执行人登记实际追回后，已付净额归 0
+        self.c.recover_overpayment(self.did, "payer-1", PAYER)
+        explained = self.c.explain_case(self.case)["reporters"][0]
+        self.assertEqual(explained["paid_amount"], 0)
+        self.assertEqual(explained["paid_total"], 0)
+        self.assertEqual(explained["recoverable_amount"], 0)
 
     def test_withdrawal_before_approval_terminates_proposal(self):
         # 新举报 + 在途建议，随后撤回
@@ -461,6 +501,305 @@ class CommendationAndSupplementsTest(unittest.TestCase):
         self.assertEqual(view["reports"][0]["supplements"][0]["facts"],
                          ["补充证据1", "补充证据2"])
         self.assertNotIn("identity", json.dumps(view, ensure_ascii=False))
+
+
+class AdjustmentFundBoundaryTest(unittest.TestCase):
+    """调整与资金流水边界：核准上限与真实资金动作严格分离。"""
+
+    def _setup_case(self, penalty=1_000_000, grade=2):
+        # 价格违法严重度 0.7：100 万 ×4%×0.7 = 28000，二级无需会签
+        c = make_center()
+        alias, case_id, code = intake(
+            c, "价格违法", ["事实A"], "2026-02-01",
+            identity={"name": "测试举报人"})
+        c.close_case(case_id, penalty)
+        c.enter_reward_stage(case_id)
+        decisions = settle(c, case_id, [
+            {"alias": alias, "grade": grade, "new_facts": ["事实A"]}])
+        return c, alias, case_id, code, decisions[alias]["decision_id"]
+
+    def _person(self, c, case_id):
+        return c.explain_case(case_id)["reporters"][0]
+
+    # 1. 零付款降额 -----------------------------------------------------
+
+    def test_zero_payment_decrease_writes_no_fund_flow(self):
+        c, alias, case_id, _, did = self._setup_case()
+        # 50 万 ×4%×0.7 = 14000
+        adj_id = c.adjust_decision(
+            did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=500_000)
+        c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
+
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 14_000)
+        self.assertEqual(person["paid_amount"], 0)
+        self.assertEqual(person["payable_amount"], 14_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(person["fund_flows"], [])  # 未付款不产生任何资金记录
+        # 无款可追
+        with self.assertRaises(DomainError):
+            c.recover_overpayment(did, "payer-1", PAYER)
+        # 只能在新的核准上限内补付
+        rec = c.pay_decision(did, "payer-1", PAYER)
+        self.assertEqual(rec["amount"], 14_000)
+        person = self._person(c, case_id)
+        self.assertEqual(person["paid_amount"], 14_000)
+        self.assertEqual(person["payable_amount"], 0)
+
+    def test_zero_payment_reset_to_zero_has_no_negative_balance(self):
+        c, alias, case_id, _, did = self._setup_case()
+        adj_id = c.adjust_decision(did, "duplicate", "handler-1", HANDLER)
+        c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
+        person = self._person(c, case_id)
+        # 缺陷回归点：累计支付不得为负
+        self.assertEqual(person["approved_amount"], 0)
+        self.assertEqual(person["paid_amount"], 0)
+        self.assertEqual(person["payable_amount"], 0)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(person["fund_flows"], [])
+        with self.assertRaises(DomainError):
+            c.pay_decision(did, "payer-1", PAYER)
+        with self.assertRaises(DomainError):
+            c.recover_overpayment(did, "payer-1", PAYER)
+
+    # 2. 部分付款后降额 -------------------------------------------------
+
+    def test_partial_payment_decrease_within_paid_keeps_payable(self):
+        c, alias, case_id, _, did = self._setup_case()
+        c.pay_decision(did, "payer-1", PAYER, amount=10_000)
+        # 降到 14000：已付 10000 未超额，仍可补付 4000，无追回
+        adj_id = c.adjust_decision(
+            did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=500_000)
+        c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 14_000)
+        self.assertEqual(person["paid_amount"], 10_000)
+        self.assertEqual(person["payable_amount"], 4_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(len(person["fund_flows"]), 1)  # 生效不写流水
+        c.pay_decision(did, "payer-1", PAYER, amount=4_000)
+        with self.assertRaises(DomainError):
+            c.pay_decision(did, "payer-1", PAYER, amount=1)
+        with self.assertRaises(DomainError):
+            c.recover_overpayment(did, "payer-1", PAYER, amount=1)
+
+    def test_partial_payment_decrease_recovery_capped_at_overpayment(self):
+        c, alias, case_id, _, did = self._setup_case()
+        c.pay_decision(did, "payer-1", PAYER, amount=20_000)
+        adj_id = c.adjust_decision(did, "duplicate", "handler-1", HANDLER)
+        c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 0)
+        self.assertEqual(person["paid_amount"], 20_000)
+        self.assertEqual(person["payable_amount"], 0)
+        self.assertEqual(person["recoverable_amount"], 20_000)
+        # 超付未追回前不得支付
+        with self.assertRaises(DomainError):
+            c.pay_decision(did, "payer-1", PAYER, amount=1)
+        # 追回不得超过已付超额
+        with self.assertRaises(DomainError):
+            c.recover_overpayment(did, "payer-1", PAYER, amount=20_001)
+        c.recover_overpayment(did, "payer-1", PAYER, amount=15_000)
+        person = self._person(c, case_id)
+        self.assertEqual(person["paid_amount"], 5_000)
+        self.assertEqual(person["recoverable_amount"], 5_000)
+        with self.assertRaises(DomainError):
+            c.recover_overpayment(did, "payer-1", PAYER, amount=5_001)
+        c.recover_overpayment(did, "payer-1", PAYER)
+        person = self._person(c, case_id)
+        self.assertEqual(person["paid_amount"], 0)
+        self.assertEqual(person["recoverable_amount"], 0)
+
+    # 3. 先降后升 -------------------------------------------------------
+
+    def test_down_then_up_requires_payer_for_every_outlay(self):
+        c, alias, case_id, _, did = self._setup_case()
+        c.pay_decision(did, "payer-1", PAYER)  # 全额付 28000
+        # 降到 14000 并全额追回
+        adj_down = c.adjust_decision(
+            did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=500_000)
+        c.review_adjustment(adj_down, "reviewer-1", REVIEWER)
+        self.assertEqual(self._person(c, case_id)["recoverable_amount"], 14_000)
+        c.recover_overpayment(did, "payer-1", PAYER)
+        self.assertEqual(self._person(c, case_id)["paid_amount"], 14_000)
+        # 再升回 28000：只恢复可付余额，绝不自动出款
+        adj_up = c.adjust_decision(
+            did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=1_000_000)
+        c.review_adjustment(adj_up, "reviewer-1", REVIEWER)
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 28_000)
+        self.assertEqual(person["paid_amount"], 14_000)
+        self.assertEqual(person["payable_amount"], 14_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(c.adjustments[adj_up]["supplement_due"], 14_000)
+        # 升额未触发任何系统出款
+        self.assertFalse(any(
+            f["note"] == "补付" or f.get("paid_by") == "system-adjustment"
+            for f in c.payments))
+        # 补付仍须支付岗位逐笔办理
+        with self.assertRaises(PermissionDenied):
+            c.pay_decision(did, "handler-1", HANDLER)
+        c.pay_decision(did, "payer-1", PAYER)
+        person = self._person(c, case_id)
+        self.assertEqual(person["paid_amount"], 28_000)
+        self.assertEqual(person["payable_amount"], 0)
+        # 追加式谱系：原决定、两道调整、逐笔流水都保留
+        self.assertEqual(len(person["adjustments"]), 2)
+        self.assertEqual(c.decisions[did]["amount"], 28_000)
+
+    # 4. 驳回与在途调整 -------------------------------------------------
+
+    def test_pending_and_rejected_adjustment_do_not_change_balance(self):
+        c, alias, case_id, _, did = self._setup_case()
+        c.pay_decision(did, "payer-1", PAYER, amount=5_000)
+        adj_id = c.adjust_decision(
+            did, "reconsideration", "handler-1", HANDLER,
+            new_penalty_amount=500_000)
+        # 在途期间：核准上限仍是 28000，可付 23000，无追回
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 28_000)
+        self.assertEqual(person["payable_amount"], 23_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        # 驳回：余额维持调整前结论
+        c.review_adjustment(adj_id, "reviewer-1", REVIEWER, approve=False)
+        person = self._person(c, case_id)
+        self.assertEqual(person["approved_amount"], 28_000)
+        self.assertEqual(person["paid_amount"], 5_000)
+        self.assertEqual(person["payable_amount"], 23_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(person["adjustments"][0]["status"], "已驳回")
+        # 驳回后正常支付，并可再次发起调整
+        c.pay_decision(did, "payer-1", PAYER, amount=23_000)
+        again = c.adjust_decision(
+            did, "judgment", "handler-1", HANDLER,
+            new_penalty_amount=500_000)
+        self.assertTrue(again)
+
+
+class ConcurrentPaymentAndAdjustmentTest(unittest.TestCase):
+    """并发支付与调整：锁串行后只产生唯一、可解释的结果。"""
+
+    def _setup_case(self):
+        c = make_center()
+        alias, case_id, code = c.intake_report(
+            "intake-1", INTAKE, "价格违法", ["事实A"], received_at="2026-02-01",
+            identity={"name": "测试举报人"})
+        c.close_case(case_id, 1_000_000)
+        c.enter_reward_stage(case_id)
+        decisions = settle(c, case_id, [
+            {"alias": alias, "grade": 2, "new_facts": ["事实A"]}])
+        return c, case_id, decisions[alias]["decision_id"]
+
+    def _run_threads(self, target, n):
+        barrier = threading.Barrier(n)
+        results = [None] * n
+
+        def worker(i):
+            barrier.wait()
+            try:
+                target(i)
+                results[i] = ("ok", None)
+            except Exception as exc:  # noqa: BLE001 - 汇总各线程结果
+                results[i] = ("err", type(exc).__name__)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def test_concurrent_full_payments_single_winner(self):
+        c, case_id, did = self._setup_case()
+        results = self._run_threads(
+            lambda i: c.pay_decision(did, f"payer-{i}", PAYER), 8)
+        wins = [r for r in results if r == ("ok", None)]
+        self.assertEqual(len(wins), 1)  # 只有一笔能全额支付
+        person = c.explain_case(case_id)["reporters"][0]
+        self.assertEqual(person["paid_amount"], 28_000)
+        ids = [f["payment_id"] for f in person["fund_flows"]]
+        self.assertEqual(len(ids), len(set(ids)))  # 流水号不重号
+
+    def test_concurrent_partial_payments_never_exceed_balance(self):
+        c, case_id, did = self._setup_case()
+        results = self._run_threads(
+            lambda i: c.pay_decision(did, f"payer-{i}", PAYER, amount=10_000),
+            8)
+        # 28000 可付余额：恰好两笔 10000 成功，其余失败
+        wins = [r for r in results if r == ("ok", None)]
+        self.assertEqual(len(wins), 2)
+        person = c.explain_case(case_id)["reporters"][0]
+        self.assertEqual(person["paid_amount"], 20_000)
+        self.assertEqual(person["payable_amount"], 8_000)
+
+    def test_concurrent_adjustment_creation_single_pending(self):
+        c, case_id, did = self._setup_case()
+
+        def create(i):
+            c.adjust_decision(did, "reconsideration", "handler-1", HANDLER,
+                              new_penalty_amount=500_000)
+
+        results = self._run_threads(create, 8)
+        wins = [r for r in results if r == ("ok", None)]
+        self.assertEqual(len(wins), 1)  # 同一决定只允许一道在途调整
+        pending = [a for a in c.adjustments.values()
+                   if a["decision_id"] == did]
+        self.assertEqual(len(pending), 1)
+
+    def test_concurrent_payment_vs_down_adjustment_is_explainable(self):
+        c, case_id, did = self._setup_case()
+
+        def pay(_i):
+            c.pay_decision(did, "payer-1", PAYER)
+
+        def adjust_and_review(_i):
+            try:
+                adj_id = c.adjust_decision(
+                    did, "duplicate", "handler-1", HANDLER)
+            except InvalidStateError:
+                return  # 支付已先发生且……此分支理论上不会在未付款时出现
+            c.review_adjustment(adj_id, "reviewer-1", REVIEWER)
+
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def runner(fn):
+            barrier.wait()
+            try:
+                fn(0)
+            except DomainError as exc:
+                errors.append(str(exc))
+
+        t1 = threading.Thread(target=runner, args=(pay,))
+        t2 = threading.Thread(target=runner, args=(adjust_and_review,))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        person = c.explain_case(case_id)["reporters"][0]
+        paid = person["paid_amount"]
+        approved = person["approved_amount"]
+        if paid == 28_000:
+            # 支付先于调整：调整生效后形成 28000 待追回，无负余额、无自动追回
+            self.assertEqual(approved, 0)
+            self.assertEqual(person["recoverable_amount"], 28_000)
+            self.assertEqual(person["payable_amount"], 0)
+            for f in person["fund_flows"]:
+                self.assertGreaterEqual(f["amount"], 0)
+        else:
+            # 调整先于支付：支付被拒，未付为 0，亦无待追回
+            self.assertEqual(paid, 0)
+            self.assertEqual(approved, 0)
+            self.assertEqual(person["recoverable_amount"], 0)
+            self.assertTrue(errors)
+        # 无论哪种顺序，资金四口径自洽：已付 = 核准 + 待追回 - 可付
+        self.assertEqual(
+            paid,
+            approved + person["recoverable_amount"]
+            - person["payable_amount"])
 
 
 if __name__ == "__main__":

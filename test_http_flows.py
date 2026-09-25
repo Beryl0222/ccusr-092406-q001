@@ -230,13 +230,39 @@ class HttpFlowTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(approved["status"], "已生效")
 
+        # 生效只改核准上限，不自动产生资金流水：已付仍为 25 万，待追回 10 万
         _, explain = self.get(f"/cases/{case_id}/explain")
         person = explain["reporters"][0]
+        self.assertEqual(person["approved_amount"], 150_000)
         self.assertEqual(person["effective_amount"], 150_000)
-        self.assertEqual(person["paid_total"], 150_000)
+        self.assertEqual(person["paid_amount"], 250_000)
+        self.assertEqual(person["paid_total"], 250_000)
+        self.assertEqual(person["payable_amount"], 0)
+        self.assertEqual(person["recoverable_amount"], 100_000)
+        self.assertEqual(len(person["fund_flows"]), 1)
         self.assertEqual(person["adjustments"][0]["kind_label"], "行政复议变化")
         # 旧结论保留
         self.assertEqual(person["current_decision"]["amount"], 250_000)
+
+        # 追回必须由支付执行人办理，且不得超过已付超额
+        self.assertEqual(self.post("/rewards/recover", {
+            "actor": actor("reviewer-2", "reward_reviewer"),
+            "decision_id": did, "amount": 100_000})[0], 403)
+        self.assertEqual(self.post("/rewards/recover", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 100_001})[0], 400)
+        status, rec = self.post("/rewards/recover", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 100_000})
+        self.assertEqual(status, 200)
+        self.assertEqual(rec["amount"], -100_000)
+        self.assertEqual(rec["fund_kind"], "recovery")
+
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["paid_amount"], 150_000)
+        self.assertEqual(person["paid_total"], 150_000)
+        self.assertEqual(person["recoverable_amount"], 0)
 
     def test_unknown_route_and_bad_json(self):
         with self.assertRaises(HTTPError) as error:

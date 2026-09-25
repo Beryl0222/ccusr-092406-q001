@@ -129,6 +129,15 @@ def handle_pay(center, body):
     return 200, record
 
 
+def handle_recover(center, body):
+    actor_id, role = _actor(body)
+    record = center.recover_overpayment(
+        body["decision_id"], actor_id, role,
+        amount=body.get("amount"), recovered_at=body.get("at"),
+        reason=body.get("reason", ""))
+    return 200, record
+
+
 def handle_adjust(center, body):
     actor_id, role = _actor(body)
     adj_id = center.adjust_decision(
@@ -183,6 +192,7 @@ POST_ROUTES = {
     "/rewards/approve": handle_approve,
     "/rewards/cosign": handle_cosign,
     "/rewards/pay": handle_pay,
+    "/rewards/recover": handle_recover,
     "/rewards/adjust": handle_adjust,
     "/rewards/adjustment/approve": handle_adjustment_approve,
     "/rewards/adjustment/cosign": handle_adjustment_cosign,
