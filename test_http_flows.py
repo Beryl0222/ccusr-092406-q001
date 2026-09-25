@@ -238,6 +238,66 @@ class HttpFlowTest(unittest.TestCase):
         # 旧结论保留
         self.assertEqual(person["current_decision"]["amount"], 250_000)
 
+    def test_zero_payment_reduction_creates_no_funds_record(self):
+        # 价格违法二级、100 万罚没：28,000 元，无需会签；实名举报免领取码
+        _, body = self.post("/reports/intake", {
+            "actor": actor("intake-1", "intake_officer"),
+            "violation_category": "价格违法",
+            "facts": ["事实A：价格串通"], "received_at": "2026-02-01",
+            "identity": {"name": "钱七-不外露"}})
+        alias, case_id = body["alias"], body["case_id"]
+        self.post("/cases/close", {
+            "case_id": case_id, "penalty_amount": 1_000_000,
+            "at": "2026-03-01"})
+        self.post("/cases/reward-stage", {
+            "case_id": case_id, "at": "2026-03-05"})
+        self.post("/cases/assess", {
+            "actor": actor("intake-1", "intake_officer"),
+            "case_id": case_id,
+            "assessments": [{"alias": alias, "grade": 2,
+                             "new_facts": ["事实A：价格串通"]}]})
+        _, proposed = self.post("/rewards/propose", {
+            "actor": actor("handler-1", "case_handler"), "case_id": case_id})
+        did = proposed["decision_ids"][0]
+        self.post("/rewards/approve", {
+            "actor": actor("reviewer-1", "reward_reviewer"),
+            "decision_id": did})
+
+        # 复议降额至 50 万罚没：14,000 元；此时尚未发生任何支付
+        status, adj = self.post("/rewards/adjust", {
+            "actor": actor("handler-1", "case_handler"),
+            "decision_id": did, "kind": "reconsideration",
+            "new_penalty_amount": 500_000, "at": "2026-06-01"})
+        self.assertEqual(status, 201)
+        self.assertEqual(adj["new_amount"], 14_000)
+        self.post("/rewards/adjustment/approve", {
+            "actor": actor("reviewer-2", "reward_reviewer"),
+            "adjustment_id": adj["adjustment_id"]})
+
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        # 核准/已付/可付/待追回四口径：未付款降额不产生负数追回
+        self.assertEqual(person["approved_amount"], 14_000)
+        self.assertEqual(person["paid_amount"], 0)
+        self.assertEqual(person["payable_balance"], 14_000)
+        self.assertEqual(person["recoverable_amount"], 0)
+        self.assertEqual(person["payments"], [])
+        self.assertEqual(person["paid_total"], 0)
+
+        # 沿旧额支付被拒，沿新上限支付成功
+        self.assertEqual(self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 28_000})[0], 400)
+        status, paid = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "amount": 14_000})
+        self.assertEqual(status, 200)
+        _, explain = self.get(f"/cases/{case_id}/explain")
+        person = explain["reporters"][0]
+        self.assertEqual(person["paid_amount"], 14_000)
+        self.assertEqual(person["payable_balance"], 0)
+        self.assertNotIn("钱七", json.dumps(explain, ensure_ascii=False))
+
     def test_unknown_route_and_bad_json(self):
         with self.assertRaises(HTTPError) as error:
             urlopen(f"{self.base_url}/unknown", timeout=2)

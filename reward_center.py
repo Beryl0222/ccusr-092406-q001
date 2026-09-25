@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import threading
 from datetime import date
 
 
@@ -198,6 +199,12 @@ class RewardCenter:
         self._decision_seq = 0
         self._adjust_seq = 0
         self._commend_seq = 0
+
+        # 资金/余额变更的全局串行锁：支付与追加决定生效只能得到一个
+        # 可解释顺序；同一时刻只有一个操作能重算“已付/可付/待追回”。
+        self._ledger_lock = threading.RLock()
+        # 追加式谱系的全局序号：支付与调整结算共用，决定先发生顺序
+        self._ledger_seq = 0
 
     # ------------------------------------------------------------------
     # 基础工具
@@ -584,34 +591,40 @@ class RewardCenter:
         report = self.reports[d["alias"]]
         if report["withdrawn"]:
             raise InvalidStateError("举报人已撤回，不得支付")
-        chain = self._adjustment_chain(d)
-        if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
-                                              ADJUST_PENDING_COSIGN):
-            raise InvalidStateError("存在在途追加决定，待办结后再支付")
-        # 以已生效追加决定后的金额为支付上限
-        tail = self._tail_adjustment(d)
-        cap_amount = tail["new_amount"] if tail else d["amount"]
-        already = self._paid_amount(decision_id)
-        if report["is_anonymous"]:
-            if not claim_code:
-                raise PermissionDenied("匿名举报须凭领取码支付")
-            digest = hashlib.sha256(claim_code.encode()).hexdigest()
-            if digest != report["claim_code_hash"]:
-                raise PermissionDenied("领取码校验失败")
-        remaining = cap_amount - already
-        pay_amount = _round_yuan(amount if amount is not None else remaining)
-        if pay_amount <= 0 or pay_amount > remaining:
-            raise DomainError(f"可支付余额为 {max(remaining, 0)} 元")
-        record = {
-            "payment_id": f"P-{len(self.payments) + 1:04d}",
-            "decision_id": decision_id,
-            "alias": d["alias"],
-            "case_id": d["case_id"],
-            "amount": pay_amount,
-            "paid_by": payer_id,
-            "paid_at": paid_at or self._today(),
-        }
-        self.payments.append(record)
+        # 支付与调整结算共用同一把锁：并发时后者要么先于本笔支付结算，
+        # 要么在本笔支付之后结算，不会出现交错的错误余额。
+        with self._ledger_lock:
+            chain = self._adjustment_chain(d)
+            if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
+                                                  ADJUST_PENDING_COSIGN):
+                raise InvalidStateError("存在在途追加决定，待办结后再支付")
+            # 以已生效追加决定后的金额为支付上限
+            tail = self._tail_adjustment(d)
+            cap_amount = tail["new_amount"] if tail else d["amount"]
+            already = self._paid_amount(decision_id)
+            if report["is_anonymous"]:
+                if not claim_code:
+                    raise PermissionDenied("匿名举报须凭领取码支付")
+                digest = hashlib.sha256(claim_code.encode()).hexdigest()
+                if digest != report["claim_code_hash"]:
+                    raise PermissionDenied("领取码校验失败")
+            remaining = cap_amount - already
+            pay_amount = _round_yuan(amount if amount is not None else remaining)
+            if pay_amount <= 0 or pay_amount > remaining:
+                raise DomainError(f"可支付余额为 {max(remaining, 0)} 元")
+            self._ledger_seq += 1
+            record = {
+                "payment_id": f"P-{len(self.payments) + 1:04d}",
+                "ledger_seq": self._ledger_seq,
+                "decision_id": decision_id,
+                "alias": d["alias"],
+                "case_id": d["case_id"],
+                "amount": pay_amount,
+                "paid_by": payer_id,
+                "paid_at": paid_at or self._today(),
+                "note": "支付",
+            }
+            self.payments.append(record)
         self._log("奖励支付", alias=d["alias"], case_id=d["case_id"],
                   decision_id=decision_id, amount=pay_amount)
         return record
@@ -692,40 +705,44 @@ class RewardCenter:
     def _make_adjustment(self, decision, kind, new_amount, note,
                          proposed_by, changed_at=None, base_amount=None):
         rule = self._rule_by_version(decision["rule_version"])
-        chain = self._adjustment_chain(decision)
-        if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
-                                              ADJUST_PENDING_COSIGN):
-            raise InvalidStateError("该决定已有在途追加决定，须先办结")
-        if base_amount is None:
-            tail = self._tail_adjustment(decision)
-            base_amount = tail["new_amount"] if tail else decision["amount"]
-        # 追加决定链：指向上一节点（原决定或上一道追加决定），形成完整沿革
-        chain = self._adjustment_chain(decision)
-        prev_id = chain[-1]["adjustment_id"] if chain else None
-        adj = {
-            "adjustment_id": self._next_id("ADJ", "_adjust_seq"),
-            "kind": kind,
-            "kind_label": ADJUST_KIND_LABELS[kind],
-            "decision_id": decision["decision_id"],
-            "prev_adjustment_id": prev_id,
-            "case_id": decision["case_id"],
-            "alias": decision["alias"],
-            "old_amount": base_amount,
-            "new_amount": new_amount,
-            "delta": new_amount - base_amount,
-            "rule_version": decision["rule_version"],
-            "needs_cosign": new_amount >= rule["cosign_threshold"],
-            "status": ADJUST_PENDING_REVIEW,
-            "reason": note,
-            "proposed_by": proposed_by,
-            "reviewed_by": None,
-            "cosigned_by": None,
-            "created_at": changed_at or self._today(),
-        }
-        self.adjustments[adj["adjustment_id"]] = adj
-        # 只在首次被调整时留痕；原决定记录始终保留不删改
-        if decision.get("superseded_by") is None:
-            decision["superseded_by"] = adj["adjustment_id"]
+        # 与支付共用锁：调整入链要么先于支付（支付看到在途而被拒），
+        # 要么晚于支付（按已付额结算），只存在这两种可解释顺序。
+        with self._ledger_lock:
+            chain = self._adjustment_chain(decision)
+            if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
+                                                  ADJUST_PENDING_COSIGN):
+                raise InvalidStateError("该决定已有在途追加决定，须先办结")
+            if base_amount is None:
+                tail = self._tail_adjustment(decision)
+                base_amount = tail["new_amount"] if tail else decision["amount"]
+            # 追加决定链：指向上一节点（原决定或上一道追加决定），形成完整沿革
+            prev_id = chain[-1]["adjustment_id"] if chain else None
+            adj = {
+                "adjustment_id": self._next_id("ADJ", "_adjust_seq"),
+                "kind": kind,
+                "kind_label": ADJUST_KIND_LABELS[kind],
+                "decision_id": decision["decision_id"],
+                "prev_adjustment_id": prev_id,
+                "case_id": decision["case_id"],
+                "alias": decision["alias"],
+                "old_amount": base_amount,
+                "new_amount": new_amount,
+                "delta": new_amount - base_amount,
+                "rule_version": decision["rule_version"],
+                "needs_cosign": new_amount >= rule["cosign_threshold"],
+                "status": ADJUST_PENDING_REVIEW,
+                "reason": note,
+                "proposed_by": proposed_by,
+                "reviewed_by": None,
+                "cosigned_by": None,
+                "created_at": changed_at or self._today(),
+                # 生效结算时写入实际追回额；None 表示尚未生效，未参与余额
+                "clawback_amount": None,
+            }
+            self.adjustments[adj["adjustment_id"]] = adj
+            # 只在首次被调整时留痕；原决定记录始终保留不删改
+            if decision.get("superseded_by") is None:
+                decision["superseded_by"] = adj["adjustment_id"]
         self._log("追加决定", alias=decision["alias"], case_id=decision["case_id"],
                   adjustment_id=adj["adjustment_id"], kind=kind,
                   old_amount=base_amount, new_amount=new_amount)
@@ -801,21 +818,43 @@ class RewardCenter:
         return adj["status"]
 
     def _effect_adjustment(self, adj):
-        adj["status"] = ADJUST_EFFECTIVE
-        delta = adj["delta"]
-        if delta != 0:
-            # 正向为补付，负向为追回（金额记负）
-            self.payments.append({
-                "payment_id": f"P-{len(self.payments) + 1:04d}",
-                "decision_id": adj["decision_id"],
-                "adjustment_id": adj["adjustment_id"],
-                "alias": adj["alias"],
-                "case_id": adj["case_id"],
-                "amount": delta,
-                "paid_by": "system-adjustment",
-                "paid_at": self._today(),
-                "note": "补付" if delta > 0 else "追回",
-            })
+        """追加决定生效：只改变核准上限，资金动作按此前真实支付额结算。
+
+        - 降额（new_amount < old_amount）：
+          追回额 = max(0, 实际已付 − 新核准额)，不得超过已付超额；
+          未付款时不产生任何资金记录，仅压低后续可付上限；
+        - 升额（new_amount > old_amount）：
+          不绕过支付岗位自动出款，不产生补付记录，只形成可付余额，
+          由支付执行人逐笔支付；
+        - 核准额不变（delta == 0）：无资金动作。
+        驳回或仍在审核的调整不会进入本方法，因而不影响余额。
+        """
+        with self._ledger_lock:
+            adj["status"] = ADJUST_EFFECTIVE
+            paid_before = self._paid_amount(adj["decision_id"])
+            clawback = max(0, paid_before - adj["new_amount"])
+            adj["clawback_amount"] = clawback
+            if clawback > 0:
+                self._ledger_seq += 1
+                self.payments.append({
+                    "payment_id": f"P-{len(self.payments) + 1:04d}",
+                    "ledger_seq": self._ledger_seq,
+                    "decision_id": adj["decision_id"],
+                    "adjustment_id": adj["adjustment_id"],
+                    "alias": adj["alias"],
+                    "case_id": adj["case_id"],
+                    "amount": -clawback,
+                    "paid_by": "system-adjustment",
+                    "paid_at": self._today(),
+                    "note": "追回",
+                })
+                self._log("调整追回", alias=adj["alias"], case_id=adj["case_id"],
+                          decision_id=adj["decision_id"],
+                          adjustment_id=adj["adjustment_id"],
+                          amount=-clawback)
+            # 升额/未付款降额均不写资金流水：核准上限已经更新，
+            # 后续支付一律以新核准额 − 已付额为可付余额。
+        return adj["status"]
 
     # ------------------------------------------------------------------
     # 8. 精神奖励（与物质奖励并行）
@@ -906,6 +945,33 @@ class RewardCenter:
         effective_amount = None
         if current is not None:
             effective_amount = tail["new_amount"] if tail else current["amount"]
+
+        # 四个资金口径：核准金额（当前生效上限）/ 已付金额（实际净支付）/
+        # 可付余额（支付岗位尚可支付）/ 待追回金额（已付超出核准的部分）
+        approved_amount = effective_amount
+        paid_amount = paid
+        if approved_amount is None:
+            payable_balance = None
+            recoverable_amount = None
+        else:
+            payable_balance = max(0, approved_amount - paid_amount)
+            recoverable_amount = max(0, paid_amount - approved_amount)
+
+        # 每笔支付/追回按全局顺序原样保留（追加式谱系，不做就地冲销）
+        ledger = [{
+            "payment_id": p["payment_id"],
+            "ledger_seq": p.get("ledger_seq"),
+            "amount": p["amount"],
+            "paid_at": p["paid_at"],
+            "paid_by": p["paid_by"],
+            "note": p.get("note", "支付"),
+            "adjustment_id": p.get("adjustment_id"),
+        } for p in sorted(
+            (p for p in self.payments
+             if p["alias"] == alias and p["case_id"] == case["case_id"]),
+            key=lambda p: (p.get("ledger_seq") is None, p.get("ledger_seq", 0),
+                           p["payment_id"]))]
+
         commendations = [c for c in self.commendations.values()
                          if c["alias"] == alias]
 
@@ -924,17 +990,23 @@ class RewardCenter:
                     "status": current["status"],
                     "rule_version": current["rule_version"],
                 }),
+            "approved_amount": approved_amount,
             "effective_amount": effective_amount,
+            "paid_amount": paid_amount,
+            "paid_total": paid,
+            "payable_balance": payable_balance,
+            "recoverable_amount": recoverable_amount,
             "adjustments": [{
                 "adjustment_id": a["adjustment_id"],
                 "kind_label": a["kind_label"],
                 "old_amount": a["old_amount"],
                 "new_amount": a["new_amount"],
+                "clawback_amount": a.get("clawback_amount"),
                 "status": a["status"],
                 "reason": a["reason"],
             } for a in adjustments],
+            "payments": ledger,
             "pending_approvals": pending,
-            "paid_total": paid,
             "commendations": [
                 {"level": c["level"], "granted_at": c["granted_at"]}
                 for c in commendations],
